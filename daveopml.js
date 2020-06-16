@@ -8,6 +8,11 @@ const stream = require ("stream"); //6/23/15 by DW
 const opmlParser = require ("opmlparser"); //6/23/15 by DW
 const fs = require ("fs"); //11/9/17 by DW
 
+const events = require ("events");
+const util = require ("util");
+const rp = require ("request-promise-native");
+
+const readFile = util.promisify(fs.readFile);
 
 var opmlData = { 
 	flUseOutlineCache: false,
@@ -93,17 +98,109 @@ function copyScalars (source, dest) { //8/31/14 by DW
 			}
 		}
 	}
+
+async function* outlineGenerator (eventEmitter, theOutline, flStopAtDocs = true) {
+	function readInclude (theIncludeNode) {
+		console.log ("readInclude: url == " + theIncludeNode.url);
+		return readOpmlUrl (theIncludeNode.url).then (function (theOutline) {
+			if (theOutline === undefined) {
+				return undefined;
+				}
+			else {
+				return expandIncludes (theOutline, flStopAtDocs);
+				}
+			});
+		}
+	function typeIsDoc (theNode) {
+		if (flStopAtDocs) {
+			var type = getNodeType (theNode);
+			return ((type !== undefined) && (type != "include") && (type != "link") && (type != "tweet"));
+			}
+		else {
+			return (false);
+			}
+		}
+
+	let head = theOutline;
+	let path = "";
+	let ixsub = 0;
+	const stack = [];
+
+	eventEmitter.emit('inlevel');
+
+	if (head.type === 'include') {
+		head = await readInclude(head);
+		}
+
+	if (head.subs != null) {
+		for (; ixsub < head.subs.length; ixsub++) {
+			const sub = head.subs [ixsub];
+			const subpath = path + getNameAtt (sub);
+			if (!getBoolean (sub.iscomment)) {
+				if (typeIsDoc (sub) && sub.type === "index") {
+					subpath += "/";
+					}
+
+				yield { theNode: sub, path: subpath };
+
+				if (!typeIsDoc (sub)) {
+					let newHead;
+					if (sub.type == "include") {
+						newHead = await readInclude (sub);
+						}
+					else if (sub.subs != null) {
+						newHead = sub;
+						}
+
+					if (newHead != null) {
+						stack.push({ head, path, ixsub });
+						head = newHead;
+						path = subpath + "/";
+						ixsub = -1;
+						eventEmitter.emit('inlevel');
+						}
+					}					
+				}
+
+			if (ixsubs + 1 === head.subs.length) {
+				eventEmitter.emit('outlevel');
+
+				if (stack.length > 0) {
+					const prev = stack.pop();
+					head = prev.head;
+					path = prev.path;
+					ixsub = prev.ixsub;
+					}
+				}
+			}
+		}
+	else {
+		eventEmitter.emit('outlevel');
+		}
+	}
+
+function outlineIterator (outline, flStopAtDocs) {
+	const eventEmitter = new events.EventEmitter();
+	const it = outlineGenerator(eventEmitter, outline, flStopAtDocs);
+
+	it.on = function (event, listener) {
+		eventEmitter.on(event, listener);
+		};
+
+	return it;
+	}
+
 function outlineVisiter (theOutline, inlevelcallback, outlevelcallback, nodecallback, visitcompletecallback, flStopAtDocs) {
 	function readInclude (theIncludeNode, callback) {
 		console.log ("readInclude: url == " + theIncludeNode.url);
-		readOpmlUrl (theIncludeNode.url, function (theOutline) {
+		readOpmlUrl (theIncludeNode.url).then (function (theOutline) {
 			if (theOutline === undefined) {
 				callback (undefined);
 				}
 			else {
-				expandIncludes (theOutline, function (expandedOutline) {
+				expandIncludes (theOutline, flStopAtDocs).then (function (expandedOutline) {
 					callback (expandedOutline); 
-					}, flStopAtDocs);
+					});
 				}
 			});
 		}
@@ -187,148 +284,140 @@ function outlineVisiter (theOutline, inlevelcallback, outlevelcallback, nodecall
 		visitcompletecallback ();
 		});
 	}
-function expandIncludes (theOutline, callback, flStopAtDocs) {
+async function expandIncludes (theOutline, flStopAtDocs) {
 	var theNewOutline = new Object (), lastNewNode = theNewOutline, stack = new Array (), currentOutline;
-	function inlevelcallback () {
+
+	const it = outlineIterator(theOutline, flStopAtDocs);
+
+	it.on('inlevel', function () {
 		stack [stack.length] = currentOutline;
 		currentOutline = lastNewNode;
 		if (currentOutline.subs === undefined) {
 			currentOutline.subs = new Array ();
 			}
-		}
-	function nodecallback (theNode, path) {
+		});
+	
+	it.on('outlevel', function () {
+		currentOutline = stack [stack.length - 1];
+		stack.length--; //pop the stack
+		});
+
+	for await (const { theNode, path } of it) {
 		var newNode = new Object ();
 		copyScalars (theNode, newNode);
 		currentOutline.subs [currentOutline.subs.length] = newNode;
 		lastNewNode = newNode;
 		}
-	function outlevelcallback () {
-		currentOutline = stack [stack.length - 1];
-		stack.length--; //pop the stack
-		}
-	
-	if (flStopAtDocs === undefined) { //7/15/15 by DW
-		flStopAtDocs = true;
-		}
-	
-	outlineVisiter (theOutline, inlevelcallback, outlevelcallback, nodecallback, function () {
-		callback (theNewOutline);
-		}, flStopAtDocs);
+
+	return theNewOutline;
 	}
-function readOpmlString (s, callback, flExpandIncludes) {
-	var opmlparser = new opmlParser ();
-	var outlineArray = new Array ();
-	var metadata = undefined;
-	var flparseerror = false;
-	var theStream = new stream.Readable ();
-	theStream._read = function noop () {}; 
-	theStream.push (s);
-	theStream.push (null);
-	theStream.pipe (opmlparser);
-	
-	opmlparser.on ("error", function (error) {
-		console.log ("readOpmlString: opml parser error == " + error.message);
-		if (callback != undefined) {
-			callback (undefined, error);
-			}
-		flparseerror = true;
-		});
-	opmlparser.on ("readable", function () {
-		var outline;
-		while (outline = this.read ()) {
-			var ix = Number (outline ["#id"]);
-			outlineArray [ix] = outline;
-			if (metadata === undefined) {
-				metadata = this.meta;
-				}
-			}
-		});
-	opmlparser.on ("end", function () {
-		if (flparseerror) {
-			return;
-			}
-		var theOutline = new Object ();
+function readOpmlString (s, flExpandIncludes) {
+	return new Promise (function (resolve, reject) {
+		var opmlparser = new opmlParser ();
+		var outlineArray = new Array ();
+		var metadata = undefined;
+		var flparseerror = false;
+		var theStream = new stream.Readable ();
+		theStream._read = function noop () {}; 
+		theStream.push (s);
+		theStream.push (null);
+		theStream.pipe (opmlparser);
 		
-		//copy elements of the metadata object into the root of the outline
-			function copyone (name) {
-				if (metadata !== undefined) { //3/11/18 by DW
-					var val = metadata [name];
-					if ((val !== undefined) && (val != null)) {
-						theOutline [name] = val;
+		opmlparser.on ("error", function (error) {
+			console.log ("readOpmlString: opml parser error == " + error.message);
+			reject (error);
+			flparseerror = true;
+			});
+		opmlparser.on ("readable", function () {
+			var outline;
+			while (outline = this.read ()) {
+				var ix = Number (outline ["#id"]);
+				outlineArray [ix] = outline;
+				if (metadata === undefined) {
+					metadata = this.meta;
+					}
+				}
+			});
+		opmlparser.on ("end", function () {
+			if (flparseerror) {
+				return;
+				}
+			var theOutline = new Object ();
+			
+			//copy elements of the metadata object into the root of the outline
+				function copyone (name) {
+					if (metadata !== undefined) { //3/11/18 by DW
+						var val = metadata [name];
+						if ((val !== undefined) && (val != null)) {
+							theOutline [name] = val;
+							}
 						}
 					}
+				copyone ("title");
+				copyone ("datecreated");
+				copyone ("datemodified");
+				copyone ("ownername");
+				copyone ("owneremail");
+				copyone ("description");
+			
+			for (var i = 0; i < outlineArray.length; i++) {
+				var obj = outlineArray [i];
+				if (obj != null) {
+					var idparent = obj ["#parentid"], parent;
+					if (idparent == 0) {
+						parent = theOutline;
+						}
+					else {
+						parent = outlineArray [idparent];
+						}
+					if (parent.subs === undefined) {
+						parent.subs = new Array ();
+						}
+					parent.subs [parent.subs.length] = obj;
+					delete obj ["#id"];
+					delete obj ["#parentid"];
+					}
 				}
-			copyone ("title");
-			copyone ("datecreated");
-			copyone ("datemodified");
-			copyone ("ownername");
-			copyone ("owneremail");
-			copyone ("description");
-		
-		for (var i = 0; i < outlineArray.length; i++) {
-			var obj = outlineArray [i];
-			if (obj != null) {
-				var idparent = obj ["#parentid"], parent;
-				if (idparent == 0) {
-					parent = theOutline;
-					}
-				else {
-					parent = outlineArray [idparent];
-					}
-				if (parent.subs === undefined) {
-					parent.subs = new Array ();
-					}
-				parent.subs [parent.subs.length] = obj;
-				delete obj ["#id"];
-				delete obj ["#parentid"];
+			
+			if (flExpandIncludes === undefined) { //7/15/15 by DW
+				flExpandIncludes = true;
 				}
-			}
-		
-		if (flExpandIncludes === undefined) { //7/15/15 by DW
-			flExpandIncludes = true;
-			}
-		if (flExpandIncludes) {
-			expandIncludes (theOutline, function (expandedOutline) {
-				if (callback != undefined) {
-					callback (expandedOutline, undefined);
-					}
-				}, false);
-			}
-		else {
-			if (callback != undefined) {
-				callback (theOutline, undefined);
+			if (flExpandIncludes) {
+				expandIncludes (theOutline, false).then (function (expandedOutline) {
+					resolve (expandedOutline)
+					});
 				}
-			}
+			else {
+				resolve (theOutline);
+				}
+			});
 		});
 	}
-function readOpmlFile (f, callback, flExpandIncludes) {
-	fs.readFile (f, function (err, data) {
-		if (err) {
+function readOpmlFile (f, flExpandIncludes) {
+	return readFile(f)
+		.then (function (data) {
+			return readOpmlString (data.toString (),flExpandIncludes);
+			})
+		.catch (function (err) {
 			console.log ("readOpmlFile: error reading file " + f + " == " + err.message)
-			callback (undefined);
-			}
-		else {
-			readOpmlString (data.toString (), callback, flExpandIncludes);
-			}
-		});
+			return undefined;
+			});
 	}
-function readOpmlUrl (urlOutline, callback, flExpandIncludes) { 
+function readOpmlUrl (urlOutline, flExpandIncludes) { 
 	if (flExpandIncludes === undefined) {
 		flExpandIncludes = true;
 		}
-	request (urlOutline, function (err, response, body) {
-		if (err !== null) {
+	return rp(urlOutline)
+		.then (function (body) {
+			return readOpmlString (body.toString (), flExpandIncludes);
+			})
+		.catch (function (err) {
+			if (err.name === 'StatusCodeError') {
+				console.log ("readOpmlUrl: error reading file, statusCode == " + err.statusCode + ", urlOutline == " + urlOutline)
+				return undefined;
+				}
+
 			console.log ("readOpmlUrl: error reading file " + urlOutline + " == " + err.message)
-			callback (undefined);
-			}
-		else {
-			if (response.statusCode != 200) {
-				console.log ("readOpmlUrl: error reading file, statusCode == " + response.statusCode + ", urlOutline == " + urlOutline)
-				callback (undefined);
-				}
-			else {
-				readOpmlString (body.toString (), callback, flExpandIncludes);
-				}
-			}
-		});
+			return undefined;
+			});
 	}

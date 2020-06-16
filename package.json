@@ -8,13 +8,14 @@
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/scripting/opml.git"
-		},
+	},
 	"files": [
 		"daveopml.js"
-		],
-	"dependencies" : {
+	],
+	"dependencies": {
+		"opmlparser": "*",
 		"request": "*",
-		"stream": "*",
-		"opmlparser": "*"
-		} 
+		"request-promise-native": "^1.0.8",
+		"stream": "*"
 	}
+}
